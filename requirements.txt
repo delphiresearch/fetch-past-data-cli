@@ -1,0 +1,4 @@
+requests
+datetime
+python-dotenv
+py-clob-client
