@@ -89,6 +89,6 @@ class EventFetcher:
         url = f"{self.base_url}/events"
         if params:
             url = f"{url}?{urlencode(params, doseq=True)}"
-        print("url:", url)
+        # print("url:", url)
         response = requests.get(url)
         return response.json()

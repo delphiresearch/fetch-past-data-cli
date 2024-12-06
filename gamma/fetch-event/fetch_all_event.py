@@ -17,13 +17,30 @@ all_events = []
 
 LIMIT = 100
 MAX_EVENTS = 20000
-# イベントを100件ずつ取得して結合
-for i in tqdm(range(0, MAX_EVENTS, LIMIT), desc="Fetching events"):
+
+class RangeFormatter:
+    def __init__(self, n):
+        self.n = n
+
+    def format_range(self):
+        start = self.n * LIMIT
+        end = (self.n + 1) * LIMIT
+        return f"Range: {start}-{end}"
+
+    def __format__(self, format_spec):
+        return self.format_range()
+
+range_formatter = RangeFormatter(0)
+for i in tqdm(range(0, MAX_EVENTS, LIMIT), 
+             desc="Fetching events", 
+             bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [eta {remaining}] ({postfix})',
+             postfix=range_formatter):
+    range_formatter.n = i // LIMIT
     events = fetcher.fetch_events(offset=i, limit=LIMIT)
     if events == []:
         print("No more events to fetch")
         break
-    all_events.extend(events)  # リストに追加
+    all_events.extend(events)
 
 # 結合したイベントデータをJSONファイルとして保存
 print("Summary of fetched events:")

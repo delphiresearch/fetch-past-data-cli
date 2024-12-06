@@ -4,3 +4,5 @@ python-dotenv
 py-clob-client
 supabase
 backoff
+tabulate
+termcolor

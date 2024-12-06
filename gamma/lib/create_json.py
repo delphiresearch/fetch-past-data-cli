@@ -3,29 +3,29 @@ import os
 
 def create_json_file(data, filename):
     """
-    JSONデータをファイルとして保存する関数
+    Function to save JSON data as a file
     
     Args:
-        data: JSON形式に変換可能なPythonオブジェクト
-        filename: 作成するJSONファイルの名前（.json拡張子は自動で追加）
+        data: Python object that can be converted to JSON format
+        filename: Name of the JSON file to create (.json extension will be added automatically)
     """
-    # データが空の配列かチェック
+    # Check if data is an empty array
     if isinstance(data, list) and len(data) == 0:
-        print("エラー: データが空の配列です。JSONファイルは作成されませんでした。")
+        print("Error: Data is an empty array. JSON file was not created.")
         return
     
-    # ファイル名に.json拡張子がない場合は追加
+    # Add .json extension if not present
     if not filename.endswith('.json'):
         filename += '.json'
     
-    # 現在のスクリプトと同じディレクトリにファイルを作成
+    # Create file in the same directory as the script
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     file_path = os.path.join(project_root, "output", filename)
     
     try:
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-        print(f"JSONファイルが正常に作成されました: {file_path}")
+        print(f"JSON file successfully created: {file_path}")
     except Exception as e:
-        print(f"エラーが発生しました: {str(e)}")
+        print(f"An error occurred: {str(e)}")
 

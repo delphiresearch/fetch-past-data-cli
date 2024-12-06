@@ -34,5 +34,7 @@ python gamma/fetch-event/fetch_all_event.py
 - Input: gamma/fetch-event/output/events.json
 
 ```
-python supabase/script.py
+python supabase/script_v2.py
 ```
+- v0, v1 is slow model. v2 is fast model.
+- LogOutput: supabase/log/
