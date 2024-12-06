@@ -19,8 +19,8 @@ def create_json_file(data, filename):
         filename += '.json'
     
     # 現在のスクリプトと同じディレクトリにファイルを作成
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(current_dir, "output", filename)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    file_path = os.path.join(project_root, "output", filename)
     
     try:
         with open(file_path, 'w', encoding='utf-8') as f:

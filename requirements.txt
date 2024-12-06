@@ -2,3 +2,5 @@ requests
 datetime
 python-dotenv
 py-clob-client
+supabase
+backoff
