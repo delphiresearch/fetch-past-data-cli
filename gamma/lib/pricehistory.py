@@ -1,10 +1,13 @@
 import requests
 from typing import Optional, Union
 from datetime import datetime
+import time
 
 class PriceHistoryFetcher:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, retry_wait: int = 5, max_retries: int = 10):
         self.base_url = base_url
+        self.retry_wait = retry_wait  # 初期リトライ待機秒数
+        self.max_retries = max_retries  # 最大リトライ回数
 
     def fetch_pricehistory(self,
                           market: str,
@@ -38,21 +41,39 @@ class PriceHistoryFetcher:
 
         if fidelity is not None:
             params['fidelity'] = fidelity
+
+        # ANSIカラーコードの定義
+        RED = '\033[91m'
+        GREEN = '\033[92m'
+        RESET = '\033[0m'
+
         url = f"{self.base_url}/prices-history"
-        response = requests.get(url, params=params)
-        # # print(response.json())
-        # if len(response.json()["history"]) > 0:
-        #     # print("output summary: ")
-        #     print("length: ", len(response.json()["history"]))
-        #     print("interval: ", interval)
-        #     print('pricehistory exists')
-        #     # if len(response.json()["history"]) > 0:
-        #     #     print("start_date: ", datetime.fromtimestamp(response.json()["history"][0]["t"]).strftime('%Y-%m-%d %H:%M:%S'))
-        #     #     print("end_date: ", datetime.fromtimestamp(response.json()["history"][-1]["t"]).strftime('%Y-%m-%d %H:%M:%S'))
-        # # else:
-        # #     print("no data")
-        try:
-            return response.json()
-        except requests.exceptions.JSONDecodeError as e:
-            print(f"JSONデコードエラー: {e}")
-            return {"error": "Invalid JSON response"}
+
+        for attempt in range(self.max_retries):
+            response = requests.get(url, params=params)
+            
+            if response.status_code != 200:
+                if attempt == self.max_retries - 1:  # 最後の試行でエラーの場合のみ表示
+                    print(f"{RED}HTTP Error: Status code {response.status_code}{RESET}")
+                    print(f"{RED}Failed after all retry attempts{RESET}")
+                    return {"error": f"HTTP error {response.status_code}"}
+                # 指数関数的バックオフ: 待機時間を2倍ずつ増やす
+                wait_time = self.retry_wait * (2 ** attempt)
+                time.sleep(wait_time)
+                continue
+
+            try:
+                data = response.json()
+                return data
+            except requests.exceptions.JSONDecodeError as e:
+                if attempt == self.max_retries - 1:  # 最後の試行でエラーの場合のみ表示
+                    print(f"{RED}JSON Decode Error: {e}{RESET}")
+                    print(response.text)
+                    print(f"{RED}Failed after all retry attempts{RESET}")
+                    return {"error": "Retry limit exceeded"}
+                # 指数関数的バックオフ: 待機時間を2倍ずつ増やす
+                wait_time = self.retry_wait * (2 ** attempt)
+                time.sleep(wait_time)
+                continue
+
+        return {"error": "Retry limit exceeded"}

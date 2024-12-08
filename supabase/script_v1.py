@@ -5,467 +5,359 @@ import os
 import sys
 from tqdm import tqdm
 import logging
-from datetime import datetime
-import argparse
-from time import time
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
-import queue
-from functools import partial
-import backoff
-from typing import Optional
-import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import time
+
+# 設定用ディクショナリ
+CONFIG = {
+    "BATCH_SIZE": 10000,
+    "ERROR_LOG": "log/error_log.log",
+    "MAX_WORKERS_EVENTS": 100,
+    "MAX_WORKERS_MARKETS": 5,
+    "EVENT_CHUNK_SIZE": 100,
+    "RETRY_COUNT": 5,       # 再試行回数
+    "RETRY_DELAY": 5        # 再試行前待機秒数
+}
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)  # 一つ上のディレクトリ
+project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
-from gamma.lib.fetch_single_pricehistory import fetch_all_pricehistory
-# 環境変数の読み込み
+
+from gamma.fetch_market_pricehistory.fetch_pricehistory import fetch_pricehistory
+
 load_dotenv()
 
-# Supabase接続設定
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Supabaseクライアントの初期化
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def setup_logging():
-    """ログ設定の修正"""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename = f'sync_log_{timestamp}.log'
-    error_log_filename = f'error_log_{timestamp}.log'
-    
-    # 通常のログハンドラー
-    file_handler = logging.FileHandler(log_filename)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-    
-    # コラーログ用ハンドラー
-    error_handler = logging.FileHandler(error_log_filename)
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s\n'
-        'Message: %(message)s\n'
-        'Stack Trace: %(exc_info)s\n'
-        '-------------------\n'
-    ))
-    
-    # コンソールハンドラー（進捗のみ）
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
-    console_handler.setFormatter(logging.Formatter('%(message)s'))
-    
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
-    logger.addHandler(error_handler)
-    logger.addHandler(console_handler)
-    
-    return logger
+os.makedirs("log", exist_ok=True)
 
-@backoff.on_exception(
-    backoff.expo,
-    Exception,
-    max_tries=3,
-    on_backoff=lambda details: logging.error(
-        f"Retry attempt {details['tries']} after {details['wait']} seconds"
+logger = logging.getLogger("error_logger")
+logger.setLevel(logging.ERROR)
+fh = logging.FileHandler(CONFIG["ERROR_LOG"])
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+
+with open("../gamma/output/events.json", "r") as f:
+    event_data = json.load(f)
+
+total_markets = sum(len(event.get("markets", [])) for event in event_data)
+
+GREEN = "\033[32m"
+BLUE = "\033[34m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+main_pbar_events = tqdm(total=len(event_data), position=0, dynamic_ncols=True, leave=True, desc=f"{GREEN}All Events{RESET}")
+main_pbar_markets = tqdm(total=total_markets, position=1, dynamic_ncols=True, leave=True, desc=f"{BLUE}All Markets{RESET}")
+main_pbar_prices = tqdm(total=0, position=2, dynamic_ncols=True, leave=True, desc=f"{YELLOW}All Prices{RESET}")
+
+pbar_threads = []
+for i in range(CONFIG["MAX_WORKERS_EVENTS"]):
+    p = tqdm(
+        total=1,
+        position=3+i,
+        dynamic_ncols=True,
+        leave=True,
+        bar_format="{desc}"
     )
-)
-def retry_wrapper(func, *args, **kwargs):
-    """リトライ機能付きの関数ラッパー"""
-    try:
-        return func(*args, **kwargs)
-    except Exception as e:
-        logger = logging.getLogger(__name__)
-        error_details = {
-            'error': str(e),
-            'stack_trace': traceback.format_exc(),
-            'extra': {
-                'args': args,
-                'kwargs': kwargs
-            }
-        }
-        logger.error(
-            f"Error in {func.__name__}",
-            extra={
-                'stack_trace': error_details['stack_trace'],
-                'extra': json.dumps(error_details['extra'], default=str)
-            }
-        )
-        raise
+    p.set_description(f"{GREEN}Thread-{i}{RESET}: Idle")
+    pbar_threads.append(p)
 
-def insert_events(event_data):
-    """イベントデータを挿入"""
-    try:
-        event_response = supabase.table("events").upsert({
-            "id": event_data["id"],
-            "ticker": event_data.get("ticker"),
-            "slug": event_data.get("slug"),
-            "title": event_data.get("title"),
-            "description": event_data.get("description"),
-            "resolution_source": event_data.get("resolutionSource"),
-            "start_date": event_data.get("startDate"),
-            "creation_date": event_data.get("creationDate"),
-            "end_date": event_data.get("endDate"),
-            "image": event_data.get("image"),
-            "icon": event_data.get("icon"),
-            "active": event_data.get("active"),
-            "closed": event_data.get("closed"),
-            "archived": event_data.get("archived"),
-            "new": event_data.get("new"),
-            "featured": event_data.get("featured"),
-            "restricted": event_data.get("restricted"),
-            "liquidity": event_data.get("liquidity"),
-            "volume": event_data.get("volume"),
-            "open_interest": event_data.get("openInterest"),
-            "sort_by": event_data.get("sortBy"),
-            "created_at": event_data.get("createdAt"),
-            "updated_at": event_data.get("updatedAt"),
-            "competitive": event_data.get("competitive"),
-            "volume_24hr": event_data.get("volume24hr"),
-            "enable_order_book": event_data.get("enableOrderBook"),
-            "liquidity_clob": event_data.get("liquidityClob"),
-            "_sync": event_data.get("_sync"),
-            "neg_risk": event_data.get("negRisk"),
-            "neg_risk_market_id": event_data.get("negRiskMarketID"),
-            "comment_count": event_data.get("commentCount"),
-            "tags": json.loads(event_data.get("tags")) if isinstance(event_data.get("tags"), str) else event_data.get("tags", None),
-            "cyom": event_data.get("cyom"),
-            "show_all_outcomes": event_data.get("showAllOutcomes"),
-            "show_market_images": event_data.get("showMarketImages"),
-            "enable_neg_risk": event_data.get("enableNegRisk"),
-            "gmp_chart_mode": event_data.get("gmpChartMode"),
-            "neg_risk_augmented": event_data.get("negRiskAugmented")
-        }).execute()
-        return event_response
-    except Exception as e:
-        print(f"Error inserting event {event_data.get('id')}: {str(e)}")
-        raise
+thread_lock = Lock()
+next_chunk = 0
+total_chunks = (len(event_data) + CONFIG["EVENT_CHUNK_SIZE"] - 1) // CONFIG["EVENT_CHUNK_SIZE"]
 
-def insert_market(market_data, event_id):
-    """マーケットデータを挿入"""
-    try:
-        market_response = supabase.table("markets").upsert({
-            "id": market_data["id"],
-            "event_id": event_id,
-            "question": market_data.get("question"),
-            "condition_id": market_data.get("conditionId"),
-            "slug": market_data.get("slug"),
-            "resolution_source": market_data.get("resolutionSource"),
-            "end_date": market_data.get("endDate"),
-            "liquidity": market_data.get("liquidity"),
-            "start_date": market_data.get("startDate"),
-            "image": market_data.get("image"),
-            "icon": market_data.get("icon"),
-            "description": market_data.get("description"),
-            "outcomes": json.loads(market_data.get("outcomes")) if isinstance(market_data.get("outcomes"), str) else market_data.get("outcomes", None),
-            "outcome_prices": json.loads(market_data.get("outcomePrices")) if isinstance(market_data.get("outcomePrices"), str) else market_data.get("outcomePrices", None),
-            "volume": market_data.get("volume"),
-            "active": market_data.get("active"),
-            "closed": market_data.get("closed"),
-            "market_maker_address": market_data.get("marketMakerAddress"),
-            "created_at": market_data.get("createdAt"),
-            "updated_at": market_data.get("updatedAt"),
-            "new": market_data.get("new"),
-            "featured": market_data.get("featured"),
-            "submitted_by": market_data.get("submitted_by"),
-            "archived": market_data.get("archived"),
-            "resolved_by": market_data.get("resolvedBy"),
-            "restricted": market_data.get("restricted"),
-            "group_item_title": market_data.get("groupItemTitle"),
-            "group_item_threshold": market_data.get("groupItemThreshold"),
-            "question_id": market_data.get("questionID"),
-            "enable_order_book": market_data.get("enableOrderBook"),
-            "order_price_min_tick_size": market_data.get("orderPriceMinTickSize"),
-            "order_min_size": market_data.get("orderMinSize"),
-            "volume_num": market_data.get("volumeNum"),
-            "liquidity_num": market_data.get("liquidityNum"),
-            "end_date_iso": market_data.get("endDateIso"),
-            "start_date_iso": market_data.get("startDateIso"),
-            "has_reviewed_dates": market_data.get("hasReviewedDates"),
-            "volume_24hr": market_data.get("volume24hr"),
-            "clob_token_ids": json.loads(market_data.get("clobTokenIds")) if isinstance(market_data.get("clobTokenIds"), str) else market_data.get("clobTokenIds", None),
-            "uma_bond": market_data.get("umaBond"),
-            "uma_reward": market_data.get("umaReward"),
-            "volume_24hr_clob": market_data.get("volume24hrClob"),
-            "volume_clob": market_data.get("volumeClob"),
-            "liquidity_clob": market_data.get("liquidityClob"),
-            "accepting_orders": market_data.get("acceptingOrders"),
-            "neg_risk": market_data.get("negRisk"),
-            "neg_risk_market_id": market_data.get("negRiskMarketID"),
-            "neg_risk_request_id": market_data.get("negRiskRequestID"),
-            "_sync": market_data.get("_sync"),
-            "ready": market_data.get("ready"),
-            "funded": market_data.get("funded"),
-            "accepting_orders_timestamp": market_data.get("acceptingOrdersTimestamp"),
-            "cyom": market_data.get("cyom"),
-            "competitive": market_data.get("competitive"),
-            "pager_duty_notification_enabled": market_data.get("pagerDutyNotificationEnabled"),
-            "approved": market_data.get("approved"),
-            "clob_rewards": market_data.get("clobRewards"),
-            "rewards_min_size": market_data.get("rewardsMinSize"),
-            "rewards_max_spread": market_data.get("rewardsMaxSpread"),
-            "spread": market_data.get("spread"),
-            "one_day_price_change": market_data.get("oneDayPriceChange"),
-            "last_trade_price": market_data.get("lastTradePrice"),
-            "best_bid": market_data.get("bestBid"),
-            "best_ask": market_data.get("bestAsk"),
-            "automatically_active": market_data.get("automaticallyActive", None),
-            "clear_book_on_start": market_data.get("clearBookOnStart"),
-            "series_color": market_data.get("seriesColor"),
-            "show_gmp_series": market_data.get("showGmpSeries"),
-            "show_gmp_outcome": market_data.get("showGmpOutcome"),
-            "manual_activation": market_data.get("manualActivation"),
-            "neg_risk_other": market_data.get("negRiskOther")
-        }).execute()
-        return market_response
-    except Exception as e:
-        print(f"Error inserting market {market_data.get('id')}: {str(e)}")
-        raise
-
-def insert_price_history_batch(price_records: list):
-    """価格履歴データをバッチで挿入"""
-    logger = logging.getLogger(__name__)
-    start_time = time()
-    
-    try:
-        sub_batch_size = 500
-        for i in range(0, len(price_records), sub_batch_size):
-            batch_start = time()
-            sub_batch = price_records[i:i + sub_batch_size]
-            
-            try:
-                supabase.table("prices").upsert(sub_batch).execute()
-                batch_time = time() - batch_start
-                
-                logger.info(
-                    f"@batch_insert,batch_number={i//sub_batch_size + 1},"
-                    f"record_count={len(sub_batch)},duration={batch_time:.3f}"
-                )
-                
-            except Exception as e:
-                logger.error(
-                    f"@batch_error,batch_number={i//sub_batch_size + 1},"
-                    f"record_count={len(sub_batch)},error={str(e)}"
-                )
-                raise
-                
-        total_time = time() - start_time
-        logger.info(
-            f"@batch_complete,total_records={len(price_records)},"
-            f"total_duration={total_time:.3f}"
-        )
-                
-    except Exception as e:
-        logger.error(f"@batch_fatal_error,error={str(e)}")
-        raise
-
-def process_price_history(market_id: str, price_history_data: dict) -> list:
-    """価格履歴データを処理してレコードのリストを返す"""
-    price_records = []
-    if price_history_data and "history" in price_history_data:
-        for price_point in price_history_data["history"]:
-            price_records.append({
-                "market_id": market_id,
-                "timestamp": price_point["t"],
-                "price": float(price_point["p"])
-            })
-    return price_records
-
-def process_market(market, event_id, market_pbar: Optional[tqdm] = None) -> dict:
-    """マーケット処理の改善"""
-    logger = logging.getLogger(__name__)
-    start_time = time()
-    
-    try:
-        # マーケットの挿入時間を記録
-        market_insert_start = time()
-        result = retry_wrapper(insert_market, market, event_id)
-        market_insert_time = time() - market_insert_start
-        
-        logger.info(f"@market_insert,event_id={event_id},market_id={market['id']},duration={market_insert_time:.3f}")
-        
-        # 価格履歴の取得時間を記録
-        fetch_start = time()
-        price_history_str = retry_wrapper(fetch_all_pricehistory, market)
-        fetch_time = time() - fetch_start
-        
-        logger.info(f"@price_history_fetch,event_id={event_id},market_id={market['id']},duration={fetch_time:.3f}")
-        
-        if price_history_str:
-            # 価格履歴の処理時間を記録
-            process_start = time()
-            price_history = json.loads(price_history_str)
-            price_records = process_price_history(market["id"], price_history)
-            process_time = time() - process_start
-            
-            logger.info(
-                f"@price_process,event_id={event_id},market_id={market['id']},"
-                f"duration={process_time:.3f},record_count={len(price_records)}"
-            )
-            
-            total_time = time() - start_time
-            logger.info(
-                f"@market_complete,event_id={event_id},market_id={market['id']},"
-                f"total_duration={total_time:.3f},record_count={len(price_records)}"
-            )
-            
-            if market_pbar:
-                market_pbar.update(1)
-                market_pbar.set_description(
-                    f"Market {market['id']} ({len(price_records)} prices)"
-                )
-            
-            return {
-                'market_id': market['id'],
-                'price_records': price_records,
-                'timestamp_count': len(price_records),
-                'status': 'success',
-                'metrics': {
-                    'market_insert_time': market_insert_time,
-                    'fetch_time': fetch_time,
-                    'process_time': process_time,
-                    'total_time': total_time
-                }
-            }
-        
-        return {
-            'market_id': market['id'],
-            'status': 'no_data'
-        }
-        
-    except Exception as e:
-        total_time = time() - start_time
-        logger.error(
-            f"@market_error,event_id={event_id},market_id={market.get('id')},"
-            f"duration={total_time:.3f},error={str(e)}"
-        )
-        return {
-            'market_id': market['id'],
-            'error': str(e),
-            'status': 'error'
-        }
-
-def process_event_range(start_idx: int, end_idx: int, events_data: list):
-    """イベント処理の改善"""
-    logger = logging.getLogger(__name__)
-    start_time = time()
-    
-    # 統計情報の初期化
-    stats = {
-        'processed_events': 0,
-        'processed_markets': 0,
-        'processed_price_records': 0,
-        'failed_markets': 0
-    }
-    
-    target_events = events_data[start_idx:end_idx+1]
-    batch = []
-    
-    # メインの進捗バー
-    with tqdm(total=len(target_events), desc="Events", position=0) as event_pbar:
-        # マーケットの進捗バー
-        with tqdm(desc="Markets", position=1, leave=True) as market_pbar:
-            # 処理状況表示
-            with tqdm(desc="Current Status", position=2, bar_format='{desc}') as status_bar:
-                
-                for event in target_events:
-                    try:
-                        status_bar.set_description_str(
-                            f"Processing Event {event['id']} "
-                            f"({stats['processed_markets']}/{stats['failed_markets']} markets)"
-                        )
-                        
-                        retry_wrapper(insert_events, event)
-                        stats['processed_events'] += 1
-                        
-                        total_markets = len(event['markets'])
-                        market_pbar.reset(total=total_markets)
-                        
-                        # マーケット並列処理
-                        with ThreadPoolExecutor(max_workers=20) as executor:
-                            futures = {
-                                executor.submit(
-                                    process_market,
-                                    market=market,
-                                    event_id=event['id'],
-                                    market_pbar=market_pbar
-                                ): market
-                                for market in event['markets']
-                            }
-                            
-                            for future in concurrent.futures.as_completed(futures):
-                                try:
-                                    result = future.result()
-                                    if result and result.get('status') == 'success':
-                                        stats['processed_markets'] += 1
-                                        batch.extend(result['price_records'])
-                                        
-                                        if len(batch) >= 2000:
-                                            insert_price_history_batch(batch)
-                                            stats['processed_price_records'] += len(batch)
-                                            batch = []
-                                    else:
-                                        stats['failed_markets'] += 1
-                                        if result:
-                                            logger.error(
-                                                f"Market processing failed: {result.get('market_id')} - "
-                                                f"Status: {result.get('status')} - "
-                                                f"Error: {result.get('error')}"
-                                            )
-                                
-                                except Exception as e:
-                                    logger.error("Future processing error", exc_info=True)
-                                    stats['failed_markets'] += 1
-                        
-                        event_pbar.update(1)
-                        
-                    except Exception as e:
-                        logger.error(
-                            f"Event processing error - ID: {event.get('id', 'unknown')}",
-                            exc_info=True
-                        )
-    
-    # 残りのバッチを処理
-    if batch:
+def safe_insert(table_name, record):
+    """単一レコード挿入用。エラー発生時にリトライ。"""
+    for attempt in range(CONFIG["RETRY_COUNT"]):
         try:
-            insert_price_history_batch(batch)
-            stats['processed_price_records'] += len(batch)
+            supabase.table(table_name).insert(record).execute()
+            return
         except Exception as e:
-            logger.error("Final batch processing error", exc_info=True)
-    
-    execution_time = time() - start_time
-    logger.info(f"Process complete - Execution time: {execution_time:.2f}s - Stats: {stats}")
-    
-    return {**stats, 'execution_time': execution_time}
+            logger.error(f"Error inserting into {table_name} (attempt {attempt+1}/{CONFIG['RETRY_COUNT']}): {e}")
+            time.sleep(CONFIG["RETRY_DELAY"])
+    raise Exception(f"Failed to insert into {table_name} after {CONFIG['RETRY_COUNT']} attempts")
 
-def main():
-    parser = argparse.ArgumentParser(description='イベントデータ同期スクリプト')
-    parser.add_argument('--start', type=int, help='開始インデックス')
-    parser.add_argument('--end', type=int, help='終了インデックス')
-    args = parser.parse_args()
-
-    logger = setup_logging()
-    
-    try:
-        with open("../gamma/output/events.json", "r") as f:
-            events_data = json.load(f)
-        
-        events_data = [event for event in events_data if "markets" in event]
-        
-        if args.start is not None and args.end is not None:
-            # 特定範囲の処理
-            results = process_event_range(args.start, args.end, events_data)
-            logger.info(f"指定範囲の処理結果: {results}")
+def safe_batch_insert(table_name, records, batch_size):
+    """バルクインサート用。BATCH単位で挿入し、各BATCHでエラー時にリトライ。"""
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i+batch_size]
+        for attempt in range(CONFIG["RETRY_COUNT"]):
+            try:
+                supabase.table(table_name).insert(batch).execute()
+                break
+            except Exception as e:
+                logger.error(f"Error inserting batch into {table_name} (attempt {attempt+1}/{CONFIG['RETRY_COUNT']}): {e}")
+                time.sleep(CONFIG["RETRY_DELAY"])
         else:
-            # 全データの処理
-            results = process_event_range(0, len(events_data) - 1, events_data)
-            logger.info(f"全データの処理結果: {results}")
+            # 全てのattemptで失敗
+            raise Exception(f"Failed to insert batch into {table_name} after {CONFIG['RETRY_COUNT']} attempts")
 
+def get_number_or_none(data, key):
+    value = data.get(key)
+    return value if value is not None else None
+
+def insert_event_and_tags(event):
+    # eventsテーブル挿入
+    try:
+        safe_insert("events", {
+            "id": event["id"],
+            "ticker": event.get("ticker", None),
+            "slug": event.get("slug", None),
+            "title": event.get("title", None),
+            "description": event.get("description", None),
+            "resolution_source": event.get("resolutionSource", None),
+            "start_date": event.get("startDate", None),
+            "creation_date": event.get("creationDate", None),
+            "end_date": event.get("endDate", None),
+            "image": event.get("image", None),
+            "icon": event.get("icon", None),
+            "active": event.get("active", None),
+            "closed": event.get("closed", None),
+            "archived": event.get("archived", None),
+            "new": event.get("new", None),
+            "featured": event.get("featured", None),
+            "restricted": event.get("restricted", None),
+            "liquidity": event.get("liquidity", None),
+            "volume": event.get("volume", None),
+            "open_interest": event.get("openInterest", None),
+            "sort_by": event.get("sortBy", None),
+            "created_at": event.get("createdAt", None),
+            "updated_at": event.get("updatedAt", None),
+            "competitive": event.get("competitive", None),
+            "volume_24hr": event.get("volume24hr", None),
+            "enable_order_book": event.get("enableOrderBook", None),
+            "liquidity_clob": event.get("liquidityClob", None),
+            "_sync": event.get("_sync", None),
+            "neg_risk": event.get("negRisk", None),
+            "neg_risk_market_id": event.get("negRiskMarketID", None),
+            "comment_count": event.get("commentCount", None),
+            "cyom": event.get("cyom", None),
+            "show_all_outcomes": event.get("showAllOutcomes", None),
+            "show_market_images": event.get("showMarketImages", None),
+            "enable_neg_risk": event.get("enableNegRisk", None),
+            "automatically_active": event.get("automaticallyActive", None),
+            "gmp_chart_mode": event.get("gmpChartMode", None),
+            "neg_risk_augmented": event.get("negRiskAugmented", None)
+        })
     except Exception as e:
-        logger.error(f"メイン処理エラー: {str(e)}")
-        sys.exit(1)
+        logger.error(f"Error inserting event {event['id']}: {e}")
 
-if __name__ == "__main__":
-    main()
+    # tagsテーブル挿入
+    if "tags" in event and event["tags"]:
+        tag_records = []
+        for tag in event["tags"]:
+            tag_records.append({
+                "event_id": event["id"],
+                "id": tag.get("id", None),
+                "label": tag.get("label", None),
+                "slug": tag.get("slug", None),
+                "force_show": tag.get("forceShow", None),
+                "published_at": tag.get("publishedAt", None),
+                "updated_by": tag.get("updatedBy", None),
+                "created_at": tag.get("createdAt", None),
+                "updated_at": tag.get("updatedAt", None),
+                "_sync": tag.get("_sync", None),
+                "force_hide": tag.get("forceHide", None)
+            })
+        try:
+            safe_batch_insert("tags", tag_records, CONFIG["BATCH_SIZE"])
+        except Exception as e:
+            logger.error(f"Error inserting tags for event {event['id']}: {e}")
+
+def insert_markets_and_prices(event, market):
+    # markets挿入
+    try:
+        safe_insert("markets", {
+            "id": market["id"],
+            "event_id": event["id"],
+            "question": market.get("question", None),
+            "condition_id": market.get("conditionId", None),
+            "slug": market.get("slug", None),
+            "resolution_source": market.get("resolutionSource", None),
+            "end_date": market.get("endDate", None),
+            "liquidity": get_number_or_none(market, "liquidity"),
+            "start_date": market.get("startDate", None),
+            "image": market.get("image", None),
+            "icon": market.get("icon", None),
+            "description": market.get("description", None),
+            "outcomes": json.loads(market.get("outcomes")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", None),
+            "outcome_prices": json.loads(market.get("outcomePrices")) if isinstance(market.get("outcomePrices"), str) else market.get("outcomePrices", None),
+            "volume": get_number_or_none(market, "volume"),
+            "active": market.get("active", None),
+            "closed": market.get("closed", None),
+            "market_maker_address": market.get("marketMakerAddress", None),
+            "created_at": market.get("createdAt", None),
+            "updated_at": market.get("updatedAt", None),
+            "new": market.get("new", None),
+            "featured": market.get("featured", None),
+            "submitted_by": market.get("submitted_by", None),
+            "archived": market.get("archived", None),
+            "resolved_by": market.get("resolvedBy", None),
+            "restricted": market.get("restricted", None),
+            "group_item_title": market.get("groupItemTitle", None),
+            "group_item_threshold": market.get("groupItemThreshold", None),
+            "question_id": market.get("questionID", None),
+            "enable_order_book": market.get("enableOrderBook", None),
+            "order_price_min_tick_size": market.get("orderPriceMinTickSize", None),
+            "order_min_size": market.get("orderMinSize", None),
+            "volume_num": get_number_or_none(market, "volumeNum"),
+            "liquidity_num": get_number_or_none(market, "liquidityNum"),
+            "end_date_iso": market.get("endDateIso", None),
+            "start_date_iso": market.get("startDateIso", None),
+            "has_reviewed_dates": market.get("hasReviewedDates", None),
+            "volume_24hr": get_number_or_none(market, "volume24hr"),
+            "clob_token_ids": json.loads(market.get("clobTokenIds")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", None),
+            "uma_bond": market.get("umaBond", None),
+            "uma_reward": market.get("umaReward", None),
+            "volume_24hr_clob": get_number_or_none(market, "volume24hrClob"),
+            "volume_clob": get_number_or_none(market, "volumeClob"),
+            "liquidity_clob": get_number_or_none(market, "liquidityClob"),
+            "accepting_orders": market.get("acceptingOrders", None),
+            "neg_risk": market.get("negRisk", None),
+            "neg_risk_market_id": market.get("negRiskMarketID", None),
+            "neg_risk_request_id": market.get("negRiskRequestID", None),
+            "_sync": market.get("_sync", None),
+            "ready": market.get("ready", None),
+            "funded": market.get("funded", None),
+            "accepting_orders_timestamp": market.get("acceptingOrdersTimestamp", None),
+            "cyom": market.get("cyom", None),
+            "competitive": market.get("competitive", None),
+            "pager_duty_notification_enabled": market.get("pagerDutyNotificationEnabled", None),
+            "approved": market.get("approved", None),
+            "clob_rewards": market.get("clobRewards", None),
+            "rewards_min_size": market.get("rewardsMinSize", None),
+            "rewards_max_spread": market.get("rewardsMaxSpread", None),
+            "spread": market.get("spread", None),
+            "one_day_price_change": market.get("oneDayPriceChange", None),
+            "last_trade_price": market.get("lastTradePrice", None),
+            "best_bid": market.get("bestBid", None),
+            "best_ask": market.get("bestAsk", None),
+            "automatically_active": market.get("automaticallyActive", None),
+            "clear_book_on_start": market.get("clearBookOnStart", None),
+            "series_color": market.get("seriesColor", None),
+            "show_gmp_series": market.get("showGmpSeries", None),
+            "show_gmp_outcome": market.get("showGmpOutcome", None),
+            "manual_activation": market.get("manualActivation", None),
+            "neg_risk_other": market.get("negRiskOther", None)
+        })
+    except Exception as e:
+        logger.error(f"Error inserting market {market['id']} of event {event['id']}: {e}")
+
+    # prices挿入はfetch_pricehistoryを使用
+    try:
+        # 価格履歴取得
+        if "clobTokenIds" in market and market["clobTokenIds"]:
+            token_ids = json.loads(market["clobTokenIds"]) if isinstance(market["clobTokenIds"], str) else market["clobTokenIds"]
+            if token_ids and len(token_ids) > 0:
+                price_data = fetch_pricehistory(market, token_ids[0], logger)
+                if price_data and 'history' in price_data:
+                    history = price_data['history']
+                    main_pbar_prices.reset(total=len(history))
+                    main_pbar_prices.set_description("Processing prices")
+
+                    price_records = []
+                    for h in history:
+                        price_records.append({
+                            "market_id": market["id"],
+                            "timestamp": h.get("t"),
+                            "price": h.get("p")
+                        })
+
+                    # バルクインサート（再試行付き）
+                    for i in range(0, len(price_records), CONFIG["BATCH_SIZE"]):
+                        batch = price_records[i:i+CONFIG["BATCH_SIZE"]]
+                        safe_batch_insert("prices", batch, CONFIG["BATCH_SIZE"])
+                        main_pbar_prices.update(len(batch))
+    except Exception as e:
+        logger.error(f"Error inserting prices for market {market['id']} of event {event['id']}: {e}")
+
+def process_market_for_thread(market, event_id, markets_total, pbar_thread, thread_id, start_idx, end_idx):
+    pbar_thread.set_description(
+        f"{GREEN}Thread-{thread_id}{RESET} [{start_idx}-{end_idx}] {BLUE}Event:{event_id}{RESET} Processing Market:{market['id']} ({markets_total} total):"
+    )
+    insert_markets_and_prices({"id": event_id}, market)
+    main_pbar_markets.update(1)
+    return (1, 0)
+
+def process_event_for_thread(event, thread_id, pbar_thread, start_idx, end_idx):
+    event_id = event["id"]
+    markets = event.get("markets", [])
+    pbar_thread.set_description(
+        f"{GREEN}Thread-{thread_id}{RESET} [{start_idx}-{end_idx}] {BLUE}Event:{event_id}{RESET} Processing..."
+    )
+
+    # events, tags挿入
+    insert_event_and_tags(event)
+    main_pbar_events.update(1)
+
+    market_count = 0
+    price_count = 0
+    if markets:
+        with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS_MARKETS"]) as ex:
+            futures = [ex.submit(process_market_for_thread, m, event_id, len(markets), pbar_thread, thread_id, start_idx, end_idx) for m in markets]
+            for f in as_completed(futures):
+                m_c, p_c = f.result()
+                market_count += m_c
+                # price_countはmarkets挿入内で挿入済み
+    else:
+        pbar_thread.set_description(
+            f"{GREEN}Thread-{thread_id}{RESET} [{start_idx}-{end_idx}] {BLUE}Event:{event_id}{RESET} (No markets):"
+        )
+
+    return (1, market_count, price_count)
+
+def process_event_chunk(events_chunk, chunk_idx, start_idx, end_idx, thread_id):
+    pbar_threads[thread_id].set_description(
+        f"{GREEN}Thread-{thread_id}{RESET} [{start_idx}-{end_idx}] Starting Chunk {chunk_idx+1}/{total_chunks}:"
+    )
+
+    event_count = 0
+    market_count = 0
+    price_count = 0
+    for e in events_chunk:
+        e_c, m_c, p_c = process_event_for_thread(e, thread_id, pbar_threads[thread_id], start_idx, end_idx)
+        event_count += e_c
+        market_count += m_c
+        price_count += p_c
+
+    pbar_threads[thread_id].set_description(
+        f"{GREEN}Thread-{thread_id}{RESET} [{start_idx}-{end_idx}] Chunk {chunk_idx+1}/{total_chunks} Done:"
+    )
+    return (event_count, market_count, price_count)
+
+def get_next_chunk():
+    global next_chunk
+    with thread_lock:
+        if next_chunk < total_chunks:
+            c = next_chunk
+            next_chunk += 1
+            return c
+        else:
+            return None
+
+def worker_main(thread_id):
+    while True:
+        c_i = get_next_chunk()
+        if c_i is None:
+            pbar_threads[thread_id].set_description(f"{GREEN}Thread-{thread_id}{RESET}: Idle (No more chunks)")
+            break
+        start_idx = c_i * CONFIG["EVENT_CHUNK_SIZE"]
+        end_idx = min(start_idx + CONFIG["EVENT_CHUNK_SIZE"], len(event_data)) - 1
+        events_chunk = event_data[start_idx:end_idx+1]
+        process_event_chunk(events_chunk, c_i, start_idx, end_idx, thread_id)
+    return
+
+with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS_EVENTS"]) as executor:
+    futures = [executor.submit(worker_main, i) for i in range(CONFIG["MAX_WORKERS_EVENTS"])]
+    for f in as_completed(futures):
+        f.result()
+
+main_pbar_events.close()
+main_pbar_markets.close()
+main_pbar_prices.close()

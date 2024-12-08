@@ -10,7 +10,6 @@ from supabase import create_client, Client
 from tqdm import tqdm
 from tabulate import tabulate
 from termcolor import colored
-import pandas as pd
 
 # プロジェクトルートディレクトリをPythonパスに追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -48,8 +47,13 @@ def compare_with_supabase(local_event_data, input_event_index, supabase_client: 
             print(f"Market [{market['id']}]\t\t{market_db.data[0]['id']}\t\t{event['markets'][i]['id']}\t\t", end='')
             print(colored("●", 'green') if market_match else colored("●", 'red'))
             # Price History比較
-            local_price_history = (json.loads(fetch_all_pricehistory(market)))["history"]
-
+            raw_price_history = fetch_all_pricehistory(market)
+            if raw_price_history is None:
+                print(f"Price History\t\tN/A\t\tN/A\t\t", end='')
+                print(colored("●", 'red'))
+                return
+            
+            local_price_history = json.loads(raw_price_history)["history"]
             
             supabase_price_db = supabase_client.table('prices').select('*').eq('market_id', market['id']).execute()
             price_match = (len(local_price_history) == len(supabase_price_db.data))
@@ -59,6 +63,11 @@ def compare_with_supabase(local_event_data, input_event_index, supabase_client: 
             price_match = (supabase_price_db.data[0]['timestamp'] == local_price_history[0]['t'])
             print(f"Price History[0]\t{supabase_price_db.data[0]['timestamp']}\t{local_price_history[0]['t']}\t", end='')
             print(colored("●", 'green') if price_match else colored("●", 'red'))
+            
+            price_match = (supabase_price_db.data[-1]['timestamp'] == local_price_history[-1]['t'])
+            print(f"Price History[-1]\t{supabase_price_db.data[-1]['timestamp']}\t{local_price_history[-1]['t']}\t", end='')
+            print(colored("●", 'green') if price_match else colored("●", 'red'))
+             
    
     except IndexError:
         print(colored(f"Error: Event index {input_event_index} not found in the events array", 'red'))
@@ -98,13 +107,19 @@ def display_event_structure(start_index, end_index, check_supabase=False):
             for i, market in enumerate(event['markets']):
                 local_price_history = fetch_all_pricehistory(market)
                 total_markets += 1
-                total_price_history += len(local_price_history)
+                
+                # local_price_historyがNoneの場合の処理を追加
+                if local_price_history is None:
+                    price_history_length = 0
+                else:
+                    price_history_length = len(json.loads(local_price_history)["history"])
+                total_price_history += price_history_length
 
                 market_row = [
-                    '',                   # インデックス重複時は空白
-                    '',                   # 同じイベントIDなので空白
+                    '',
+                    '',
                     market['id'],
-                    len(local_price_history),
+                    price_history_length,
                     market.get('question', 'N/A')
                 ]
                 table_data.append(market_row)

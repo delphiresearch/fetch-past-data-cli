@@ -48,9 +48,11 @@ def fetch_closed_market_pricehistory(pricehistory_fetcher, market, clobTokenIds,
     if len(res['history']) > 0:
         with open('closed_exists.csv', 'a') as f:
             f.write(f"{market['id']},{market['startDate']},{market['endDate']},{market['createdAt']}\n")
+        return res
     else:
         with open('closed_no.csv', 'a') as f:
             f.write(f"{market['id']},{market['startDate']},{market['endDate']},{market['createdAt']}\n")
+        return None
 
 def fetch_open_market_pricehistory(pricehistory_fetcher, market, clobTokenIds, logger):
     try:
@@ -120,13 +122,15 @@ def fetch_open_market_pricehistory(pricehistory_fetcher, market, clobTokenIds, l
         fidelity=fidelity
     )
     if res.get('history') is not None:
-        tqdm.write(f"Market ID: {market['id']} - interval: {interval} - Start timestamp: {start_unix} - Fidelity: {fidelity} - price_history_length: {len(res['history'])} - opening hours: {time_diff / HOUR} hours")
+        return res
+        # tqdm.write(f"Market ID: {market['id']} - interval: {interval} - Start timestamp: {start_unix} - Fidelity: {fidelity} - price_history_length: {len(res['history'])} - opening hours: {time_diff / HOUR} hours")
+    else:
+        return None
+    # csv_data = [market['id'], interval, start_unix, best_fidelity, time_diff / HOUR]
 
-    csv_data = [market['id'], interval, start_unix, best_fidelity, time_diff / HOUR]
-
-    with open('output.csv', 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(csv_data)
+    # with open('output.csv', 'a', newline='') as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(csv_data)
 
 def fetch_pricehistory(market, clobTokenIds, logger, max_retries=3, retry_delay=5):
     """
@@ -138,42 +142,49 @@ def fetch_pricehistory(market, clobTokenIds, logger, max_retries=3, retry_delay=
         retry_delay: リトライ間の待機時間(秒)(デフォルト：5)
     """
     pricehistory_fetcher = PriceHistoryFetcher("https://clob.polymarket.com")
-    
-    for attempt in range(max_retries):
-        try:
-            if market['closed'] == True:
-                fetch_closed_market_pricehistory(pricehistory_fetcher, market, clobTokenIds, logger)
-            elif market['closed'] == False:
-                fetch_open_market_pricehistory(pricehistory_fetcher, market, clobTokenIds, logger)
-            return  # 成功した場合はループを抜ける
-            
-        except (RequestException, Exception) as e:
-            if attempt == max_retries - 1:  # 最後の試行の場合
-                logger.error(f"Market ID: {market['id']} - Failed after {max_retries} attempts: {str(e)}")
-                raise  # 最後の試行で失敗した場合は例外を再度発生させる
-            else:
-                logger.warning(f"Market ID: {market['id']} - Attempt {attempt + 1} failed: {str(e)}. Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)  # 次の試行までの待機
+    if market['active'] == True and market['archived'] == False:
+        if validate_market_fields(market, logger):
+            for attempt in range(max_retries):
+                try:
+                    if market['closed'] == True:
+                        return fetch_closed_market_pricehistory(pricehistory_fetcher, market, clobTokenIds, logger)
+                    elif market['closed'] == False:
+                        return fetch_open_market_pricehistory(pricehistory_fetcher, market, clobTokenIds, logger)
+                    return  # 成功した場合はループを抜ける
+                    
+                except (RequestException, Exception) as e:
+                    if attempt == max_retries - 1:  # 最後の試行の場合
+                        logger.error(f"Market ID: {market['id']} - Failed after {max_retries} attempts: {str(e)}")
+                        raise  # 最後の試行で失敗した場合は例外を再度発生させる
+                    else:
+                        logger.warning(f"Market ID: {market['id']} - Attempt {attempt + 1} failed: {str(e)}. Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)  # 次の試行までの待機
+        else:
+            logger.error(f"Market ID: {market['id']} - Market is not active or archived")
+            return None
+    else:
+        logger.error(f"Market ID: {market['id']} - Market is not active or archived")
+        return None
 
 
-if __name__ == "__main__":
-    # Setup logger for missing clobTokenIds
-    logger = setup_logger("error_log")
+# if __name__ == "__main__":
+#     # Setup logger for missing clobTokenIds
+#     logger = setup_logger("error_log")
     
-    project_root = os.path.dirname(os.path.dirname(current_dir))
-    file_path = os.path.join(project_root, "gamma", "output", "events.json")
+#     project_root = os.path.dirname(os.path.dirname(current_dir))
+#     file_path = os.path.join(project_root, "gamma", "output", "events.json")
     
-    with open(file_path, 'r', encoding='utf-8') as f:
-        events_data = json.load(f)
+#     with open(file_path, 'r', encoding='utf-8') as f:
+#         events_data = json.load(f)
     
-    # tqdmを使用して進捗バーを表示
-    for event in tqdm(events_data, desc="Processing events"):
-        if event.get('markets') is not None:
-            for market in event['markets']:
-                if market['active'] == True and market['archived'] == False:
-                    if validate_market_fields(market, logger):
-                        clobTokenIds = json.loads(market['clobTokenIds'])[0]
-                        # 現在のmarket idを進捗バーに表示
-                        fetch_pricehistory(market, clobTokenIds, logger)
+#     # tqdmを使用して進捗バーを表示
+#     for event in tqdm(events_data, desc="Processing events"):
+#         if event.get('markets') is not None:
+#             for market in event['markets']:
+#                 if market['active'] == True and market['archived'] == False:
+#                     if validate_market_fields(market, logger):
+#                         clobTokenIds = json.loads(market['clobTokenIds'])[0]
+#                         # 現在のmarket idを進捗バーに表示
+#                         fetch_pricehistory(market, clobTokenIds, logger)
                        
 

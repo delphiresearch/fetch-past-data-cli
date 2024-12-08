@@ -7,7 +7,6 @@ import argparse
 from tqdm import tqdm
 from tabulate import tabulate
 from termcolor import colored
-import pandas as pd
 # プロジェクトのルートディレクトリをPythonパスに追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
